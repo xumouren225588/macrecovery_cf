@@ -1,153 +1,136 @@
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const params = url.searchParams;
+/**
+ * macrecovery -> Cloudflare Worker
+ * 代理下载 Apple 网络恢复镜像中的 dmg（只要 dmg，跳过 chunklist 与验签）。
+ *
+ * 用法（URL 传参）：
+ *   https://<your-worker>.workers.dev/?mlb=<17位主板序列号>&bid=<board-id>&os=<default|latest>
+ *   - mlb  : 必填。macrecovery 协议里填给 sn 字段的 17 位逻辑板序列号（即 sn）。
+ *   - bid  : 选填，board-id，默认 Mac-27AD2F918AE68F61（MacPro7,1）。
+ *   - os   : 选填，default | latest，默认 default。
+ * 例：
+ *   https://<your-worker>.workers.dev/?mlb=F5K105303J9K3F71M&bid=Mac-27AD2F918AE68F61&os=latest
+ */
 
-    // 获取 URL 参数，默认使用 Python 脚本中的默认值
-    const bid = params.get('bid') || 'Mac-27AD2F918AE68F61';
-    const sn = params.get('sn') || '0000000000000000';
-    const osType = params.get('os') || 'default';
-    const action = params.get('action') || 'redirect'; // 默认直接重定向到 dmg，也可选 json 查看详情
+const APPLE_HOST = 'osrecovery.apple.com';
+const UA = 'InternetRecovery/1.0';
+const DEFAULT_BID = 'Mac-27AD2F918AE68F61'; // MacPro7,1
 
-    try {
-      // 1. 获取苹果恢复服务器的 Session Cookie
-      const sessionCookie = await getAppleSession();
-      if (!sessionCookie) {
-        return new Response(JSON.stringify({ error: 'Failed to obtain session from Apple' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
-      // 2. 请求恢复镜像信息
-      const imageInfo = await getIosImageInfo(sessionCookie, bid, sn, osType);
-      
-      if (!imageInfo['AU'] || !imageInfo['AT']) {
-        return new Response(JSON.stringify({ error: 'Missing image link or session from Apple response', raw: imageInfo }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
-      const dmgUrl = imageInfo['AU'];
-      const assetToken = imageInfo['AT'];
-
-      // 如果 action=json，则返回解析出的所有苹果原始响应字段
-      if (action === 'json') {
-        return new Response(JSON.stringify({
-          success: true,
-          board_id: bid,
-          mlb: sn,
-          os_type: osType,
-          info: imageInfo,
-          dmg_url: dmgUrl,
-          asset_token: assetToken
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
-      // 3. 构造带 AssetToken Cookie 的请求去代理下载或直接 302 重定向
-      // 注意：苹果的 dmg 下载链接通常强制需要对应的 Cookie 验证
-      const targetHeaders = {
-        'User-Agent': 'InternetRecovery/1.0',
-        'Cookie': `AssetToken=${assetToken}`
-      };
-
-      if (action === 'proxy') {
-        // 方案 A：通过 Worker 流式代理下载（消耗 Worker 流量和 CPU 时间）
-        const appleResponse = await fetch(dmgUrl, { headers: targetHeaders });
-        return new Response(appleResponse.body, {
-          status: appleResponse.status,
-          headers: {
-            'Content-Type': appleResponse.headers.get('Content-Type') || 'application/octet-stream',
-            'Content-Disposition': appleResponse.headers.get('Content-Disposition') || 'attachment; filename="recovery.dmg"'
-          }
-        });
-      } else {
-        // 方案 B（推荐）：返回一个带有 AssetToken 校验说明的页面，或者由于浏览器限制 302 无法携带 Cookie，
-        // 如果直接 302 会因为缺少 Cookie 导致苹果拒绝下载。
-        // 因此推荐使用流式代理（proxy），或者向客户端返回下载地址及带 Cookie 的 curl 命令。
-        return new Response(
-          JSON.stringify({
-            message: "Direct 302 redirect cannot pass 'AssetToken' cookie to Apple CDN. Please use 'action=proxy' to stream download, or use the following curl command:",
-            curl_command: `curl -H "Cookie: AssetToken=${assetToken}" -H "User-Agent: InternetRecovery/1.0" "${dmgUrl}" -o recovery.dmg`,
-            dmg_url: dmgUrl
-          }, null, 2),
-          { headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-
-    } catch (e) {
-      return new Response(JSON.stringify({ error: e.message }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-};
-
-// 辅助函数：获取 Session
-async function getAppleSession() {
-  const response = await fetch('http://osrecovery.apple.com/', {
-    headers: {
-      'Host': 'osrecovery.apple.com',
-      'User-Agent': 'InternetRecovery/1.0'
-    },
-    redirect: 'manual'
-  });
-
-  const setCookie = response.headers.get('set-cookie');
-  if (setCookie) {
-    const cookies = setCookie.split('; ');
-    for (const cookie of cookies) {
-      if (cookie.startsWith('session=')) {
-        return cookie;
-      }
-    }
-  }
-  return null;
+// 生成 len 位大写十六进制随机串（对应原脚本 generate_id）
+function genId(len) {
+  const buf = new Uint8Array(len);
+  crypto.getRandomValues(buf);
+  const HEX = '0123456789ABCDEF';
+  let s = '';
+  for (let i = 0; i < len; i++) s += HEX[buf[i] & 0x0f];
+  return s;
 }
 
-// 辅助函数：向苹果请求镜像信息
-async function getIosImageInfo(session, bid, sn, osType) {
-  const postData = new URLSearchParams({
-    'cid': generateId(16),
-    'sn': sn,
-    'bid': bid,
-    'k': generateId(64),
-    'fg': generateId(64),
-    'os': osType
-  });
-
-  const response = await fetch('http://osrecovery.apple.com/InstallationPayload/RecoveryImage', {
-    method: 'POST',
-    headers: {
-      'Host': 'osrecovery.apple.com',
-      'User-Agent': 'InternetRecovery/1.0',
-      'Cookie': session,
-      'Content-Type': 'text/plain'
-    },
-    body: postData.toString()
-  });
-
-  const text = await response.text();
+// 解析 "Key: Value" 文本为对象（恰好一个 ': ' 才算，仿原脚本行为）
+function parseKeyValue(text) {
   const info = {};
   for (const line of text.split('\n')) {
     const parts = line.split(': ');
-    if (parts.length >= 2) {
-      info[parts[0].trim()] = parts.slice(1).join(': ').trim();
-    }
+    if (parts.length === 2) info[parts[0]] = parts[1];
   }
   return info;
 }
 
-// 随机 ID 生成器（对应 Python 的 generate_id）
-function generateId(length) {
-  const chars = '0123456789ABCDEF';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+// 1) 获取 session cookie
+async function getSession() {
+  const resp = await fetch('http://' + APPLE_HOST + '/', {
+    method: 'GET',
+    headers: { 'User-Agent': UA },
+  });
+  if (!resp.ok) throw new Error('session request failed: ' + resp.status);
+  // Set-Cookie 可能是多行，找出含 session= 的那段
+  const raw = resp.headers.get('Set-Cookie') || resp.headers.get('set-cookie') || '';
+  const m = raw.match(/session=[^;]+/);
+  if (!m) throw new Error('No session in headers: ' + raw);
+  return m[0];
 }
+
+// 2) 获取镜像信息（返回 AU/AT/CU/CT/AP 等）
+async function getImageInfo(session, bid, mlb, osType) {
+  const post = [
+    ['cid', genId(16)],
+    ['sn', mlb],
+    ['bid', bid],
+    ['k', genId(64)],
+    ['fg', genId(64)],
+    ['os', osType],
+  ];
+  const body = post.map((p) => p[0] + '=' + p[1]).join('\n');
+  const resp = await fetch('http://' + APPLE_HOST + '/InstallationPayload/RecoveryImage', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'text/plain',
+      'Cookie': session,
+    },
+    body,
+  });
+  const text = await resp.text();
+  const info = parseKeyValue(text);
+  const required = ['AP', 'AU', 'AH', 'AT', 'CU', 'CH', 'CT'];
+  for (const k of required) {
+    if (!(k in info)) throw new Error('Missing key ' + k + ' in response:\n' + text);
+  }
+  return info;
+}
+
+// 3) 用 AssetToken 流式代理下载 dmg
+async function downloadDmg(info) {
+  const resp = await fetch(info['AU'], {
+    method: 'GET',
+    headers: {
+      'User-Agent': UA,
+      'Cookie': 'AssetToken=' + info['AT'],
+    },
+  });
+  if (!resp.ok || !resp.body) {
+    throw new Error('dmg fetch failed: ' + resp.status);
+  }
+
+  let fname = info['AU'].split('/').pop().split('?')[0];
+  if (!fname) fname = (info['AP'] || 'Recovery') + '.dmg';
+
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/octet-stream');
+  headers.set('Content-Disposition', 'attachment; filename="' + fname + '"');
+  const cl = resp.headers.get('Content-Length');
+  if (cl) headers.set('Content-Length', cl);
+
+  return new Response(resp.body, { status: 200, headers });
+}
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    // 简单用法说明页
+    if (request.method === 'GET' && !url.searchParams.get('mlb')) {
+      return new Response(
+        'Usage: ?mlb=<17-char MLB/sn>&bid=<board-id>&os=<default|latest>\n' +
+        'Example: ?mlb=F5K105303J9K3F71M&bid=Mac-27AD2F918AE68F61&os=latest\n',
+        { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+      );
+    }
+
+    try {
+      const mlb = url.searchParams.get('mlb') || '';
+      const bid = url.searchParams.get('bid') || DEFAULT_BID;
+      const osType = url.searchParams.get('os') === 'latest' ? 'latest' : 'default';
+
+      if (mlb.length !== 17) {
+        return new Response('ERROR: mlb (sn) must be 17 characters.\n', { status: 400 });
+      }
+
+      const session = await getSession();
+      const info = await getImageInfo(session, bid, mlb, osType);
+      // 只下载 dmg（AU/AT），忽略 chunklist（CU/CT）与验签
+      return await downloadDmg(info);
+    } catch (e) {
+      return new Response('ERROR: ' + (e && e.message ? e.message : String(e)) + '\n', { status: 500 });
+    }
+  },
+};
